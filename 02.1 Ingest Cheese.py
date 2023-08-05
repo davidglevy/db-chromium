@@ -10,6 +10,16 @@ from selenium.webdriver.chrome.service import Service
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Constants
+
+# COMMAND ----------
+
+# Defines the pages size for the woolworths result, acknowledging the UI specifies 36 by default.
+PAGE_SIZE = 36
+
+# COMMAND ----------
+
 # Instantiate an Options object
 # and add the "--headless" argument
 opts = Options()
@@ -96,13 +106,14 @@ import zlib
 
 class WoolworthsCategoryClient():
 
-  def __init__(self, cookies):
+  def __init__(self, cookies, page_size : int =36):
+    # Build the cookie header
     cookie_parts = []
-    
     for cookie in cookies:
       cookie_parts.append(f"{cookie['name']}={cookie['value']}")
-    
-    self.cookie_header = "; ".join(cookie_parts)    
+    self.cookie_header = "; ".join(cookie_parts)
+
+    self.page_size = page_size    
 
   def retrieveCategory(self, page: int, formatObject: str, categoryId: str, parentCategory: str, category: str):
     """
@@ -184,12 +195,10 @@ class WoolworthsCategoryClient():
 # COMMAND ----------
 
 cookies = driver.get_cookies()
-client = WoolworthsCategoryClient(cookies)
 
-# COMMAND ----------
-
-
-
+# We specify a page size the same as the UI client to help our
+# Traffic blend in with the other requests.
+client = WoolworthsCategoryClient(cookies, page_size=PAGE_SIZE)
 
 # COMMAND ----------
 
@@ -202,14 +211,118 @@ client = WoolworthsCategoryClient(cookies)
 
 # Process cheese
 #count_returned = -1
+import time
+import random
+
+def extractBundles(category_result):
+  return category_result['payload']['Bundles']
+
+def processBundles(bundles, category):
+  results = []
+  for index, bundle in enumerate(bundles):
+    name = bundle['Name']
+    print(f"Processing bundle [{index}] for [{name}]")
+    result = { "name" : name}
+
+    products = bundle['Products']
+    num_products_in_bundle = len(products)
+
+    messages = []
+    result['messages'] = messages
+
+    if num_products_in_bundle > 1:
+      # TODO Wrap this in function.
+      log_message = f"Expected 1 product but found {num_products_in_bundle} products in bundle, picking first"
+      messages.append({'level': 'WARN', 'code': 'MULTIPLE_PRODUCTS', 'message': log_message})
+    
+    product = products[0]
+    # TODO Put this back in. Took out so I can see the extracted records.
+    result['raw_text'] = json.dumps(product, indent=4)
+
+    result['stockcode'] = product['Stockcode']
+    result['barcode'] = product['Barcode']
+    result['package_size'] = product['PackageSize']
+    result['category'] = category
+    results.append(result)
+  return results
+ 
 
 result = client.retrieveCategory(1, "Cheese", "1_B7EF010", "dairy-eggs-fridge", "cheese")
-raw_text = json.dumps(result['payload'], indent=4)
-print(raw_text)
 
-# With result, we get TotalRecordCount, then divide by PageCount. If > PageCount, we 
+success = result['payload']['Success']
+
+if not success:
+  print("Failure - flesh this out on real example")
+else:
+  total_records = result['payload']['TotalRecordCount']
+  remainder = total_records % PAGE_SIZE
+
+  page_count = int(total_records / PAGE_SIZE)
+  if remainder > 0:
+    page_count += 1
+  print(f"We have [{page_count}] pages")
+
+products = []
+bundles = extractBundles(result)
+products.extend(processBundles(bundles, "cheese"))
+
+# Process the other results now
+for page in range(2, page_count + 1):
+  print(f"Processing page [{page}]")  
+  # Add a sleep in so we look more "human"
+  amount = random.uniform(1.5, 5.5)
+  time.sleep(amount)
+
+  result = client.retrieveCategory(page, "Cheese", "1_B7EF010", "dairy-eggs-fridge", "cheese")
+  bundles = extractBundles(result)
+  products.extend(processBundles(bundles, "cheese"))
+  
+  
 
 
+
+
+# COMMAND ----------
+
+len(products)
+
+
+# COMMAND ----------
+
+from pyspark.sql.functions import current_timestamp
+
+schema = "stockcode string, barcode string, name string, package_size string, category string, messages array<struct<level string, code string, message string>>, raw_text string"
+
+products_df = spark.createDataFrame(products, schema).withColumn("insert_ts", current_timestamp())
+
+
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC CREATE OR REPLACE TABLE products_bronze (
+# MAGIC   stockcode string,
+# MAGIC   barcode string,
+# MAGIC   name string,
+# MAGIC   package_size string,
+# MAGIC   category string,
+# MAGIC   messages array < 
+# MAGIC     struct < 
+# MAGIC       level string,
+# MAGIC       code string,
+# MAGIC       message string
+# MAGIC     > 
+# MAGIC   >,
+# MAGIC   has_cup_price boolean,
+# MAGIC   cup_measure string,
+# MAGIC   cup_price string,
+# MAGIC   raw_text string,
+# MAGIC   insert_ts timestamp
+# MAGIC );
+
+# COMMAND ----------
+
+products_df.write.mode("append").saveAsTable("products_bronze")
 
 # COMMAND ----------
 
